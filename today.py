@@ -9,11 +9,13 @@ import datetime
 from dateutil import relativedelta
 import requests
 import os
+import subprocess
+import sys
 from lxml import etree
 import time
 import hashlib
-#from dotenv import load_dotenv
-#load_dotenv()
+from dotenv import load_dotenv
+load_dotenv()
 
 # Fine-grained personal access token with All Repositories access:
 # Account permissions: read:Followers, read:Starring, read:Watching
@@ -21,6 +23,8 @@ import hashlib
 HEADERS = {'authorization': 'token '+ os.environ['ACCESS_TOKEN']}
 USER_NAME = os.environ['USER_NAME']
 QUERY_COUNT = {'user_getter': 0, 'follower_getter': 0, 'graph_repos_stars': 0, 'recursive_loc': 0, 'graph_commits': 0, 'loc_query': 0}
+
+VSCODE_VERSION = "VSCode 1.99.0"
 
 
 def daily_readme(birthday):
@@ -35,6 +39,24 @@ def daily_readme(birthday):
         diff.days, 'day' + format_plural(diff.days),
         ' 🎂' if (diff.months == 0 and diff.days == 0) else '')
 
+def get_vscode_version():
+    """Get the VS Code version by running the 'code --version' command"""
+    try:
+        # Run the 'code --version' command and capture the result
+        result = subprocess.run(['code', '--version'], 
+                               capture_output=True, 
+                               text=True, 
+                               check=True)
+        
+        # The result contains the version on the first line
+        version_info = result.stdout.strip().split('\n')
+        version = version_info[0] if version_info else "Could not retrieve version"
+        
+        return version
+    except subprocess.CalledProcessError:
+        return "Error: Could not run 'code --version'"
+    except FileNotFoundError:
+        return "Error: VS Code is not available in PATH"
 
 def format_plural(unit):
     """
@@ -324,13 +346,14 @@ def stars_counter(data):
     return total_stars
 
 
-def svg_overwrite(filename, age_data, commit_data, star_data, repo_data, contrib_data, follower_data, loc_data):
+def svg_overwrite(filename, age_data, vscode_version, commit_data, star_data, repo_data, contrib_data, follower_data, loc_data):
     """
     Parse SVG files and update elements with my age, commits, stars, repositories, and lines written
     """
     tree = etree.parse(filename)
     root = tree.getroot()
     justify_format(root, 'age_data', age_data, 49)
+    justify_format(root, 'vscode_version', vscode_version)
     justify_format(root, 'commit_data', commit_data, 22)
     justify_format(root, 'star_data', star_data, 14)
     justify_format(root, 'repo_data', repo_data, 7)
@@ -451,6 +474,7 @@ if __name__ == '__main__':
     # define global variable for owner ID and calculate user's creation date
     # e.g {'id': 'MDQ6VXNlcjU3MzMxMTM0'} and 2019-11-03T21:15:07Z for username 'fldc'
     user_data, user_time = perf_counter(user_getter, USER_NAME)
+    vscode_version = VSCODE_VERSION
     OWNER_ID, acc_date = user_data
     formatter('account data', user_time)
     age_data, age_time = perf_counter(daily_readme, datetime.datetime(1982, 10, 24))
@@ -476,8 +500,8 @@ if __name__ == '__main__':
     for index in range(len(total_loc)-1): total_loc[index] = '{:,}'.format(total_loc[index]) # format added, deleted, and total LOC
 
     print(age_data)
-    svg_overwrite('dark_mode.svg', age_data, commit_data, star_data, repo_data, contrib_data, follower_data, total_loc[:-1])
-    svg_overwrite('light_mode.svg', age_data, commit_data, star_data, repo_data, contrib_data, follower_data, total_loc[:-1])
+    svg_overwrite('dark_mode.svg', age_data, vscode_version, commit_data, star_data, repo_data, contrib_data, follower_data, total_loc[:-1])
+    svg_overwrite('light_mode.svg', age_data, vscode_version, commit_data, star_data, repo_data, contrib_data, follower_data, total_loc[:-1])
 
     # move cursor to override 'Calculation times:' with 'Total function time:' and the total function time, then move cursor back
     print('\033[F\033[F\033[F\033[F\033[F\033[F\033[F\033[F',
