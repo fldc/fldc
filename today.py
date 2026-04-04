@@ -43,7 +43,7 @@ USER_NAME = os.environ.get('USER_NAME')
 if not USER_NAME:
     raise ValueError("USER_NAME environment variable is required but not set")
 
-HEADERS = {'authorization': 'token ' + ACCESS_TOKEN}
+HEADERS = {'authorization': 'Bearer ' + ACCESS_TOKEN}
 QUERY_COUNT = {'user_getter': 0, 'follower_getter': 0, 'graph_repos_stars': 0, 'recursive_loc': 0, 'graph_commits': 0, 'loc_query': 0}
 
 # Constants for pagination and caching
