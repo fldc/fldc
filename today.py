@@ -77,6 +77,14 @@ def format_plural(unit: int) -> str:
     return 's' if unit != 1 else ''
 
 
+def accessible_edges(edges: List[Any]) -> List[Any]:
+    """
+    Filters out null edges from a GraphQL connection.
+    GitHub returns null entries for repositories the token cannot access.
+    """
+    return [edge for edge in edges if edge is not None and edge.get('node') is not None]
+
+
 def simple_request(func_name: str, query: str, variables: Dict[str, Any]) -> requests.Response:
     """
     Returns a request, or raises a QueryFailedError if the response does not succeed.
@@ -254,10 +262,10 @@ def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None,
     variables = {'owner_affiliation': owner_affiliation, 'login': USER_NAME, 'cursor': cursor}
     request = simple_request(loc_query.__name__, query, variables)
     if request.json()['data']['user']['repositories']['pageInfo']['hasNextPage']:   # If repository data has another page
-        edges += request.json()['data']['user']['repositories']['edges']            # Add on to the LoC count
+        edges += accessible_edges(request.json()['data']['user']['repositories']['edges'])          # Add on to the LoC count
         return loc_query(owner_affiliation, comment_size, force_cache, request.json()['data']['user']['repositories']['pageInfo']['endCursor'], edges)
     else:
-        return cache_builder(edges + request.json()['data']['user']['repositories']['edges'], comment_size, force_cache)
+        return cache_builder(edges + accessible_edges(request.json()['data']['user']['repositories']['edges']), comment_size, force_cache)
 
 
 def cache_builder(edges, comment_size, force_cache, loc_add=0, loc_del=0):
@@ -357,7 +365,10 @@ def stars_counter(data: List[Dict[str, Any]]) -> int:
     Count total stars in repositories owned by me
     """
     total_stars = 0
-    for node in data: total_stars += node['node']['stargazers']['totalCount']
+    for node in data:
+        if node is None or node.get('node') is None:
+            continue
+        total_stars += node['node']['stargazers']['totalCount']
     return total_stars
 
 
