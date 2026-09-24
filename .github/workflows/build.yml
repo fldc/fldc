@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -36,6 +37,10 @@ jobs:
           git config --global user.name "fldc/GitHub-Actions-Bot"
           git pull origin main --rebase || true
           git add .
-          git diff
-          git commit -m "Updated README" -a || echo "No changes to commit"
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git diff --cached
+          git commit -m "Updated README (automated)"
           git push

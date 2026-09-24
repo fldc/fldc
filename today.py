@@ -6,14 +6,14 @@ based on script by Andrew Grant
 """
 
 import datetime
+from collections import Counter
 from dateutil import relativedelta
 import requests
 import os
-import sys
 from lxml import etree
 import time
 import hashlib
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Any
 
 
 # Custom exceptions for better error handling
@@ -44,7 +44,7 @@ if not USER_NAME:
     raise ValueError("USER_NAME environment variable is required but not set")
 
 HEADERS = {'authorization': 'Bearer ' + ACCESS_TOKEN}
-QUERY_COUNT = {'user_getter': 0, 'follower_getter': 0, 'graph_repos_stars': 0, 'recursive_loc': 0, 'graph_commits': 0, 'loc_query': 0}
+QUERY_COUNT = Counter(user_getter=0, follower_getter=0, graph_repos_stars=0, recursive_loc=0, graph_commits=0, loc_query=0)
 
 # Constants for pagination and caching
 REPOS_PER_PAGE_LARGE = 100  # For star/repo queries
@@ -77,17 +77,45 @@ def format_plural(unit: int) -> str:
     return 's' if unit != 1 else ''
 
 
+GRAPHQL_URL = 'https://api.github.com/graphql'
+
+
+def _post_graphql(func_name: str, query: str, variables: Dict[str, Any], timeout: int = 30, retries: int = 4) -> requests.Response:
+    """
+    POST a GraphQL query with a timeout, retrying transient failures (network errors, 429, 5xx).
+
+    Raises QueryFailedError on bad responses and RateLimitExceededError on 403.
+    """
+    for attempt in range(retries):
+        try:
+            request = requests.post(GRAPHQL_URL, json={'query': query, 'variables': variables}, headers=HEADERS, timeout=timeout)
+        except requests.exceptions.RequestException as err:
+            if attempt == retries - 1:
+                raise QueryFailedError(f"{func_name} network error: {err}. Query count: {QUERY_COUNT}") from err
+            time.sleep(2 ** attempt)
+            continue
+        if request.status_code == 200:
+            payload = request.json()
+            if payload.get('errors'):
+                raise QueryFailedError(f"{func_name} GraphQL errors: {payload['errors']}. Query count: {QUERY_COUNT}")
+            return request
+        if request.status_code == 403:
+            raise RateLimitExceededError(f"Rate limit exceeded ({func_name}): {request.text}")
+        if request.status_code in (429, 500, 502, 503) and attempt < retries - 1:
+            time.sleep(2 ** attempt * 2)
+            continue
+        raise QueryFailedError(
+            f"{func_name} failed with status {request.status_code}: {request.text}. "
+            f"Query count: {QUERY_COUNT}"
+        )
+    raise QueryFailedError(f"{func_name} failed after {retries} attempts")  # pragma: no cover
+
+
 def simple_request(func_name: str, query: str, variables: Dict[str, Any]) -> requests.Response:
     """
     Returns a request, or raises a QueryFailedError if the response does not succeed.
     """
-    request = requests.post('https://api.github.com/graphql', json={'query': query, 'variables':variables}, headers=HEADERS)
-    if request.status_code == 200:
-        return request
-    raise QueryFailedError(
-        f"{func_name} failed with status {request.status_code}: {request.text}. "
-        f"Query count: {QUERY_COUNT}"
-    )
+    return _post_graphql(func_name, query, variables)
 
 
 def graph_commits(start_date: str, end_date: str) -> int:
@@ -110,7 +138,7 @@ def graph_commits(start_date: str, end_date: str) -> int:
     return int(request.json()['data']['user']['contributionsCollection']['contributionCalendar']['totalContributions'])
 
 
-def graph_repos_stars(count_type, owner_affiliation, cursor=None, add_loc=0, del_loc=0):
+def graph_repos_stars(count_type, owner_affiliation):
     """
     Uses GitHub's GraphQL v4 API to return my total repository, star, or lines of code count.
     """
@@ -137,92 +165,88 @@ def graph_repos_stars(count_type, owner_affiliation, cursor=None, add_loc=0, del
             }}
         }}
     }}'''
-    variables = {'owner_affiliation': owner_affiliation, 'login': USER_NAME, 'cursor': cursor}
+    variables = {'owner_affiliation': owner_affiliation, 'login': USER_NAME, 'cursor': None}
     request = simple_request(graph_repos_stars.__name__, query, variables)
-    if request.status_code == 200:
-        if count_type == 'repos':
-            return request.json()['data']['user']['repositories']['totalCount']
-        elif count_type == 'stars':
-            return stars_counter(request.json()['data']['user']['repositories']['edges'])
+    if count_type == 'repos':
+        return request.json()['data']['user']['repositories']['totalCount']
+    elif count_type == 'stars':
+        return stars_counter(request.json()['data']['user']['repositories']['edges'])
 
 
-def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, deletion_total=0, my_commits=0, cursor=None):
+def recursive_loc(owner, repo_name, data, cache_comment):
     """
-    Uses GitHub's GraphQL v4 API and cursor pagination to fetch commits from a repository at a time
+    Uses GitHub's GraphQL v4 API and cursor pagination to fetch commits from a repository,
+    summing only the LOC values of commits authored by me.
+
+    Pages through commit history iteratively (GraphQL caps at 100 commits per request).
     """
-    query_count('recursive_loc')
-    query = f'''
-    query ($repo_name: String!, $owner: String!, $cursor: String) {{
-        repository(name: $repo_name, owner: $owner) {{
-            defaultBranchRef {{
-                target {{
-                    ... on Commit {{
-                        history(first: {COMMITS_PER_PAGE}, after: $cursor) {{
-                            totalCount
-                            edges {{
-                                node {{
-                                    ... on Commit {{
-                                        committedDate
-                                    }}
-                                    author {{
-                                        user {{
-                                            id
+    addition_total = deletion_total = my_commits = 0
+    cursor = None
+    while True:
+        query_count('recursive_loc')
+        query = f'''
+        query ($repo_name: String!, $owner: String!, $cursor: String) {{
+            repository(name: $repo_name, owner: $owner) {{
+                defaultBranchRef {{
+                    target {{
+                        ... on Commit {{
+                            history(first: {COMMITS_PER_PAGE}, after: $cursor) {{
+                                totalCount
+                                edges {{
+                                    node {{
+                                        ... on Commit {{
+                                            committedDate
                                         }}
+                                        author {{
+                                            user {{
+                                                id
+                                            }}
+                                        }}
+                                        deletions
+                                        additions
                                     }}
-                                    deletions
-                                    additions
                                 }}
-                            }}
-                            pageInfo {{
-                                endCursor
-                                hasNextPage
+                                pageInfo {{
+                                    endCursor
+                                    hasNextPage
+                                }}
                             }}
                         }}
                     }}
                 }}
             }}
-        }}
-    }}'''
-    variables = {'repo_name': repo_name, 'owner': owner, 'cursor': cursor}
-    request = requests.post('https://api.github.com/graphql', json={'query': query, 'variables':variables}, headers=HEADERS) # I cannot use simple_request(), because I want to save the file before raising Exception
-    if request.status_code == 200:
-        if request.json()['data']['repository']['defaultBranchRef'] != None: # Only count commits if repo isn't empty
-            return loc_counter_one_repo(owner, repo_name, data, cache_comment, request.json()['data']['repository']['defaultBranchRef']['target']['history'], addition_total, deletion_total, my_commits)
-        else:
-            return 0, 0, 0  # Return tuple for empty repos: (additions, deletions, commits)
-    force_close_file(data, cache_comment) # saves what is currently in the file before this program crashes
-    if request.status_code == 403:
-        raise RateLimitExceededError(
-            'Too many requests in a short amount of time! '
-            'You\'ve hit the non-documented anti-abuse limit!'
-        )
-    raise QueryFailedError(
-        f"recursive_loc() failed with status {request.status_code}: {request.text}. "
-        f"Query count: {QUERY_COUNT}"
-    )
+        }}'''
+        variables = {'repo_name': repo_name, 'owner': owner, 'cursor': cursor}
+        try:
+            request = _post_graphql(recursive_loc.__name__, query, variables)
+        except GitHubAPIError:
+            force_close_file(data, cache_comment)  # save whatever was cached before the program crashes
+            raise
+
+        repository = request.json()['data']['repository']
+        if repository.get('defaultBranchRef') is None:  # Repo is empty: nothing to count
+            return 0, 0, 0
+        history = repository['defaultBranchRef']['target']['history']
+        for node in history['edges']:
+            author = node['node'].get('author') or {}
+            author_user = author.get('user') or {}
+            if author_user.get('id') == OWNER_ID:
+                my_commits += 1
+                addition_total += node['node']['additions']
+                deletion_total += node['node']['deletions']
+
+        if not history['edges'] or not history['pageInfo']['hasNextPage']:
+            return addition_total, deletion_total, my_commits
+        cursor = history['pageInfo']['endCursor']
 
 
-def loc_counter_one_repo(owner, repo_name, data, cache_comment, history, addition_total, deletion_total, my_commits):
-    """
-    Recursively call recursive_loc (since GraphQL can only search 100 commits at a time) 
-    only adds the LOC value of commits authored by me
-    """
-    for node in history['edges']:
-        if node['node']['author']['user'] == OWNER_ID:
-            my_commits += 1
-            addition_total += node['node']['additions']
-            deletion_total += node['node']['deletions']
-
-    if history['edges'] == [] or not history['pageInfo']['hasNextPage']:
-        return addition_total, deletion_total, my_commits
-    else: return recursive_loc(owner, repo_name, data, cache_comment, addition_total, deletion_total, my_commits, history['pageInfo']['endCursor'])
-
-
-def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None, edges=[]):
+def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None, edges=None):
     """
     Uses GitHub's GraphQL v4 API to query all the repositories I have access to (with respect to owner_affiliation)
     Returns the total number of lines of code in all repositories
     """
+    if edges is None:
+        edges = []
     query_count('loc_query')
     query = f'''
     query ($owner_affiliation: [RepositoryAffiliation], $login: String!, $cursor: String) {{
@@ -288,14 +312,16 @@ def cache_builder(edges, comment_size, force_cache, loc_add=0, loc_del=0):
     for index in range(len(edges)):
         repo_hash, commit_count, *__ = data[index].split()
         if repo_hash == hashlib.sha256(edges[index]['node']['nameWithOwner'].encode('utf-8')).hexdigest():
-            try:
-                if int(commit_count) != edges[index]['node']['defaultBranchRef']['target']['history']['totalCount']:
-                    # if commit count has changed, update loc for that repo
-                    owner, repo_name = edges[index]['node']['nameWithOwner'].split('/')
-                    loc = recursive_loc(owner, repo_name, data, cache_comment)
-                    data[index] = repo_hash + ' ' + str(edges[index]['node']['defaultBranchRef']['target']['history']['totalCount']) + ' ' + str(loc[2]) + ' ' + str(loc[0]) + ' ' + str(loc[1]) + '\n'
-            except TypeError: # If the repo is empty
+            default_branch = edges[index]['node'].get('defaultBranchRef')
+            if default_branch is None:  # Empty repo
                 data[index] = repo_hash + ' 0 0 0 0\n'
+                continue
+            history = default_branch['target']['history']
+            if int(commit_count) != history['totalCount']:
+                # Commit count changed: re-fetch LOC for that repo
+                owner, repo_name = edges[index]['node']['nameWithOwner'].split('/')
+                loc = recursive_loc(owner, repo_name, data, cache_comment)
+                data[index] = repo_hash + ' ' + str(history['totalCount']) + ' ' + str(loc[2]) + ' ' + str(loc[0]) + ' ' + str(loc[1]) + '\n'
     with open(filename, 'w') as f:
         f.writelines(cache_comment)
         f.writelines(data)
@@ -327,9 +353,9 @@ def add_archive():
     This function adds them using their last known data
     """
     with open('cache/repository_archive.txt', 'r') as f:
-        data = f.readlines()
-    old_data = data
-    data = data[7:len(data)-3] # remove the comment block    
+        lines = f.readlines()
+    old_data = lines
+    data = [line for line in lines[CACHE_COMMENT_SIZE:] if line.strip()]  # Strip comment block and blank lines
     added_loc, deleted_loc, added_commits = 0, 0, 0
     contributed_repos = len(data)
     for line in data:
@@ -337,7 +363,8 @@ def add_archive():
         added_loc += int(loc[0])
         deleted_loc += int(loc[1])
         if (my_commits.isdigit()): added_commits += int(my_commits)
-    added_commits += int(old_data[-1].split()[4][:-1])
+    if old_data and len(old_data[-1].split()) >= 5:
+        added_commits += int(old_data[-1].split()[4][:-1])
     return [added_loc, deleted_loc, added_loc - deleted_loc, added_commits, contributed_repos]
 
 def force_close_file(data, cache_comment):
@@ -367,15 +394,20 @@ def svg_overwrite(filename, age_data, commit_data, star_data, repo_data, contrib
     """
     tree = etree.parse(filename)
     root = tree.getroot()
-    justify_format(root, 'age_data', age_data, 49)
-    justify_format(root, 'commit_data', commit_data, 22)
-    justify_format(root, 'star_data', star_data, 14)
-    justify_format(root, 'repo_data', repo_data, 7)
-    justify_format(root, 'contrib_data', contrib_data)
-    justify_format(root, 'follower_data', follower_data, 10)
-    justify_format(root, 'loc_data', loc_data[2], 9)
-    justify_format(root, 'loc_add', loc_data[0])
-    justify_format(root, 'loc_del', loc_data[1], 8)
+    # (element_id, value, dot target length) — dot target keeps the value column aligned
+    fields = [
+        ('age_data', age_data, 49),
+        ('commit_data', commit_data, 22),
+        ('star_data', star_data, 14),
+        ('repo_data', repo_data, 7),
+        ('contrib_data', contrib_data, 0),
+        ('follower_data', follower_data, 10),
+        ('loc_data', loc_data[2], 9),
+        ('loc_add', loc_data[0], 0),
+        ('loc_del', loc_data[1], 8),
+    ]
+    for element_id, value, dot_target in fields:
+        justify_format(root, element_id, value, dot_target)
     tree.write(filename, encoding='utf-8', xml_declaration=True)
 
 
@@ -434,7 +466,7 @@ def user_getter(username):
     }'''
     variables = {'login': username}
     request = simple_request(user_getter.__name__, query, variables)
-    return {'id': request.json()['data']['user']['id']}, request.json()['data']['user']['createdAt']
+    return request.json()['data']['user']['id'], request.json()['data']['user']['createdAt']
 
 def follower_getter(username):
     """
@@ -457,7 +489,6 @@ def query_count(funct_id):
     """
     Counts how many times the GitHub GraphQL API is called
     """
-    global QUERY_COUNT
     QUERY_COUNT[funct_id] += 1
 
 
@@ -476,8 +507,10 @@ def formatter(query_type, difference, funct_return=False, whitespace=0):
     Prints a formatted time differential
     Returns formatted result if whitespace is specified, otherwise returns raw result
     """
+    elapsed = difference if difference > 1 else difference * 1000
+    unit = ' s ' if difference > 1 else ' ms'
     print('{:<23}'.format('   ' + query_type + ':'), sep='', end='')
-    print('{:>12}'.format('%.4f' % difference + ' s ')) if difference > 1 else print('{:>12}'.format('%.4f' % (difference * 1000) + ' ms'))
+    print('{:>12}'.format('%.4f' % elapsed + unit))
     if whitespace:
         return f"{'{:,}'.format(funct_return): <{whitespace}}"
     return funct_return
@@ -486,14 +519,14 @@ def formatter(query_type, difference, funct_return=False, whitespace=0):
 if __name__ == '__main__':
     print('Calculation times:')
     # define global variable for owner ID and calculate user's creation date
-    # e.g {'id': 'MDQ6VXNlcjU3MzMxMTM0'} and 2019-11-03T21:15:07Z for username 'fldc'
+    # e.g. OWNER_ID = 'MDQ6VXNlcjU3MzMxMTM0' and 2019-11-03T21:15:07Z for username 'fldc'
     user_data, user_time = perf_counter(user_getter, USER_NAME)
     OWNER_ID, acc_date = user_data
     formatter('account data', user_time)
     age_data, age_time = perf_counter(daily_readme, datetime.datetime(1982, 10, 24))
     formatter('age calculation', age_time)
     total_loc, loc_time = perf_counter(loc_query, ['OWNER', 'COLLABORATOR', 'ORGANIZATION_MEMBER'], CACHE_COMMENT_SIZE)
-    formatter('LOC (cached)', loc_time) if total_loc[-1] else formatter('LOC (no cache)', loc_time)
+    formatter('LOC (cached)' if total_loc[-1] else 'LOC (no cache)', loc_time)
     commit_data, commit_time = perf_counter(commit_counter, CACHE_COMMENT_SIZE)
     star_data, star_time = perf_counter(graph_repos_stars, 'stars', ['OWNER'])
     repo_data, repo_time = perf_counter(graph_repos_stars, 'repos', ['OWNER'])
@@ -506,10 +539,8 @@ if __name__ == '__main__':
     svg_overwrite('dark_mode.svg', age_data, commit_data, star_data, repo_data, contrib_data, follower_data, total_loc[:-1])
     svg_overwrite('light_mode.svg', age_data, commit_data, star_data, repo_data, contrib_data, follower_data, total_loc[:-1])
 
-    # move cursor to override 'Calculation times:' with 'Total function time:' and the total function time, then move cursor back
-    print('\033[F\033[F\033[F\033[F\033[F\033[F\033[F\033[F',
-        '{:<21}'.format('Total function time:'), '{:>11}'.format('%.4f' % (user_time + age_time + loc_time + commit_time + star_time + repo_time + contrib_time)),
-        ' s \033[E\033[E\033[E\033[E\033[E\033[E\033[E\033[E', sep='')
-
+    print('Total function time:', '{:<21}'.format(''),
+        '{:>11}'.format('%.4f' % (user_time + age_time + loc_time + commit_time + star_time + repo_time + contrib_time)),
+        ' s ', sep='')
     print('Total GitHub GraphQL API calls:', '{:>3}'.format(sum(QUERY_COUNT.values())))
     for funct_name, count in QUERY_COUNT.items(): print('{:<28}'.format('   ' + funct_name + ':'), '{:>6}'.format(count))
